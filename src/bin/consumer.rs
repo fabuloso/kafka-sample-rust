@@ -1,46 +1,79 @@
-use rdkafka::{consumer::Consumer, error::KafkaError};
+use rdkafka::client::ClientContext;
+use rdkafka::config::{ClientConfig, RDKafkaLogLevel};
+use rdkafka::consumer::stream_consumer::StreamConsumer;
+use rdkafka::consumer::{CommitMode, Consumer, ConsumerContext, Rebalance};
+use rdkafka::error::KafkaResult;
+use rdkafka::message::{Headers, Message};
+use rdkafka::topic_partition_list::TopicPartitionList;
+use rdkafka::util::get_rdkafka_version;
 
-/// This program demonstrates consuming messages through a `Consumer`.
-/// This is a convenient client that will fit most use cases.  Note
-/// that messages must be marked and committed as consumed to ensure
-/// only once delivery.
-fn main() {
-    let broker = "localhost:9092".to_owned();
-    let topic = "my-topic".to_owned();
-    let group = "my-group".to_owned();
+// A context can be used to change the behavior of producers and consumers by adding callbacks
+// that will be executed by librdkafka.
+// This particular context sets up custom callbacks to log rebalancing events.
+struct CustomContext;
 
-    if let Err(e) = consume_messages(group, topic, vec![broker]) {
-        println!("Failed consuming messages: {}", e);
+impl ClientContext for CustomContext {}
+
+impl ConsumerContext for CustomContext {
+    fn pre_rebalance(&self, rebalance: &Rebalance) {
+        println!("Pre rebalance {:?}", rebalance);
+    }
+
+    fn post_rebalance(&self, rebalance: &Rebalance) {
+        println!("Post rebalance {:?}", rebalance);
+    }
+
+    fn commit_callback(&self, result: KafkaResult<()>, _offsets: &TopicPartitionList) {
+        println!("Committing offsets: {:?}", result);
     }
 }
 
-fn consume_messages(group: String, topic: String, brokers: Vec<String>) -> Result<(), KafkaError> {
-    let mut con = Consumer::from_hosts(brokers)
-        .with_topic(topic)
-        .with_group(group)
-        .with_fallback_offset(FetchOffset::Earliest)
-        .with_offset_storage(GroupOffsetStorage::Kafka)
-        .create()?;
+// A type alias with your custom consumer can be created for convenience.
+type LoggingConsumer = StreamConsumer<CustomContext>;
+
+async fn consume_and_print(brokers: &str, group_id: &str, topics: &[&str]) {
+    let context = CustomContext;
+
+    let consumer: LoggingConsumer = ClientConfig::new()
+        .set("group.id", group_id)
+        .set("bootstrap.servers", brokers)
+        .set("enable.partition.eof", "false")
+        .set("session.timeout.ms", "6000")
+        .set("enable.auto.commit", "true")
+        .set_log_level(RDKafkaLogLevel::Debug)
+        .create_with_context(context)
+        .expect("Consumer creation failed");
+
+    consumer
+        .subscribe(&topics.to_vec())
+        .expect("Can't subscribe to specified topics");
 
     loop {
-        let mss = con.poll()?;
-        if mss.is_empty() {
-            println!("No messages available right now.");
-            return Ok(());
-        }
-
-        for ms in mss.iter() {
-            for m in ms.messages() {
-                println!(
-                    "{}:{}@{}: {:?}",
-                    ms.topic(),
-                    ms.partition(),
-                    m.offset,
-                    m.value
-                );
+        match consumer.recv().await {
+            Err(e) => eprintln!("Kafka error: {}", e),
+            Ok(m) => {
+                let payload = match m.payload_view::<str>() {
+                    None => "",
+                    Some(Ok(s)) => s,
+                    Some(Err(e)) => {
+                        eprintln!("Error while deserializing message payload: {:?}", e);
+                        ""
+                    }
+                };
+                println!("key: '{:?}', payload: '{}', topic: {}, partition: {}, offset: {}, timestamp: {:?}",
+                      m.key(), payload, m.topic(), m.partition(), m.offset(), m.timestamp());
+                consumer.commit_message(&m, CommitMode::Async).unwrap();
             }
-            let _ = con.consume_messageset(ms);
-        }
-        con.commit_consumed()?;
+        };
     }
+}
+
+#[tokio::main]
+async fn main() {
+    let (version_n, version_s) = get_rdkafka_version();
+    println!("rd_kafka_version: 0x{:08x}, {}", version_n, version_s);
+
+    let topics = ["topic"];
+
+    consume_and_print("localhost:9092", "consumer_2", &topics).await
 }
